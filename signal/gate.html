@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>WebRTC Tunnel [正在连接]</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --text: #e2e8f0;
+      --text-muted: #94a3b8;
+      --success: #10b981;
+      --error: #ef4444;
+      --warn: #f59e0b;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    /* 居中面板 */
+    .container {
+      width: 100%;
+      max-width: 500px;
+      padding: 40px;
+      background: var(--panel);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.05);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .title { font-size: 18px; font-weight: 600; }
+    
+    .warning {
+      background: rgba(245, 158, 11, 0.1);
+      color: var(--warn);
+      padding: 12px;
+      border-radius: 6px;
+      text-align: center;
+      font-size: 14px;
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      transition: all 0.3s ease;
+    }
+    .warning.success {
+      background: rgba(16, 185, 129, 0.1);
+      color: var(--success);
+      border-color: rgba(16, 185, 129, 0.2);
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background-color: var(--text-muted);
+      transition: all 0.3s ease;
+    }
+    .dot.connecting { background-color: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .dot.connected { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
+    .dot.failed { background-color: var(--error); box-shadow: 0 0 8px var(--error); }
+
+    .metrics {
+      display: flex;
+      justify-content: space-between;
+      background: #000;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 14px;
+    }
+
+    .console {
+      background: #000;
+      border-radius: 8px;
+      padding: 12px;
+      height: 100px;
+      overflow-y: auto;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-muted);
+    }
+    .log-line { margin-bottom: 4px; }
+    .log-line.info { color: var(--text); }
+    .log-line.success { color: var(--success); }
+    .log-line.warn { color: var(--warn); }
+    .log-line.error { color: var(--error); }
+
+    /* 跳转按钮样式 */
+    .btn-redirect {
+      display: none;
+      width: 100%;
+      padding: 14px;
+      background: var(--success);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      text-decoration: none;
+      transition: background 0.2s, transform 0.1s;
+      box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);
+    }
+    .btn-redirect:hover { background: #059669; }
+    .btn-redirect:active { transform: scale(0.98); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">正在连接到源服务器...</div>
+      <div class="status-badge">
+        <div id="status-dot" class="dot connecting"></div>
+        <span id="status-text">Connecting - WebRTC Tunnel</span>
+      </div>
+    </div>
+
+    <div class="warning" id="warning-box">
+      正在建立与源站的连接，请等待。<br>连接成功后，将自动跳转到目标页面。
+    </div>
+
+    <div class="metrics">
+      <div>RTT: <span id="metric-rtt" style="color: var(--text);">--</span> ms</div>
+      <div>SW: <span id="metric-sw" style="color: var(--text);">Waiting</span></div>
+    </div>
+
+    <div class="console" id="console"></div>
+
+    <button id="btn-redirect" class="btn-redirect">点击进入</button>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// 从 URL 解析原本要访问的地址
+const urlParams = new URLSearchParams(window.location.search);
+const redirectTarget = urlParams.get('redirect') || '/';
+
+function log(msg, type = "info") {
+  const line = document.createElement('div');
+  line.className = `log-line ${type}`;
+  line.textContent = `> ${msg}`;
+  const container = $('console');
+  container.appendChild(line);
+  container.scrollTop = container.scrollHeight;
+}
+
+function updateStatus(text, state) {
+  $('status-text').textContent = text;
+  $('status-dot').className = `dot ${state}`;
+}
+
+(async () => {
+  let pc = null, dc = null;
+  const pending = new Map();
+  const enc = new TextEncoder();
+  let pingInterval = null;
+
+  function startHeartbeat() {
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(() => {
+      if (dc && dc.readyState === 'open') {
+        const buf = new ArrayBuffer(13);
+        const view = new DataView(buf);
+        view.setUint32(0, 0); 
+        view.setUint8(4, 0x20); 
+        view.setFloat64(5, performance.now());
+        dc.send(buf);
+      }
+    }, 2000);
+  }
+
+  function onSWMessage(e) {
+    const msg = e.data;
+    if (msg.type !== "request") return;
+    const { reqId, meta, body, port } = msg;
+    pending.set(reqId, { port });
+    sendFrame(reqId, 0x01, enc.encode(JSON.stringify(meta)));
+    if (body) sendFrame(reqId, 0x02, new Uint8Array(body));
+    sendFrame(reqId, 0x03, new Uint8Array(0));
+  }
+
+  function sendFrame(reqId, ftype, payload) {
+    if (!dc || dc.readyState !== 'open') return;
+    const buf = new Uint8Array(5 + payload.byteLength);
+    new DataView(buf.buffer).setUint32(0, reqId);
+    buf[4] = ftype;
+    buf.set(payload, 5);
+    dc.send(buf.buffer);
+  }
+
+  function onDCMessage(e) {
+    const buf = e.data;
+    const view = new DataView(buf);
+    const reqId = view.getUint32(0);
+    const ftype = view.getUint8(4);
+    const payload = new Uint8Array(buf, 5);
+
+    if (ftype === 0x21) { // PONG
+      const sentTime = new DataView(buf, 5, 8).getFloat64();
+      const rtt = performance.now() - sentTime;
+      $('metric-rtt').textContent = rtt.toFixed(1);
+      return;
+    }
+
+    const req = pending.get(reqId);
+    if (!req) return;
+
+    if (ftype === 0x11) {
+      req.port.postMessage({ type: "headers", ...JSON.parse(new TextDecoder().decode(payload)) });
+    } else if (ftype === 0x12) {
+      const copy = payload.slice().buffer;
+      req.port.postMessage({ type: "chunk", data: copy }, [copy]);
+    } else if (ftype === 0x13) {
+      req.port.postMessage({ type: "end" });
+      pending.delete(reqId);
+    } else if (ftype === 0x14) {
+      req.port.postMessage({ type: "error", message: JSON.parse(new TextDecoder().decode(payload)).message });
+      pending.delete(reqId);
+    }
+  }
+
+  async function initWebRTC() {
+    try {
+      if (typeof RTCPeerConnection === 'undefined') {
+        throw new Error("当前环境禁用了 WebRTC (请使用 localhost 或 HTTPS)");
+      }
+
+      pc = new RTCPeerConnection({ iceServers: [] });
+      dc = pc.createDataChannel("http", { ordered: true });
+      dc.binaryType = "arraybuffer";
+      dc.onmessage = onDCMessage;
+      
+      dc.onopen = () => {
+        updateStatus("Connected - WebRTC Tunnel", "connected");
+        log("隧道已建立，正在为您跳转...", "success");
+        startHeartbeat();
+        
+        // 改变提示框样式
+        const warnBox = $('warning-box');
+        warnBox.classList.add('success');
+        warnBox.innerHTML = "隧道已就绪！正在跳转...";
+        
+        // 显示兜底按钮
+        const btn = $('btn-redirect');
+        btn.style.display = 'block';
+        btn.onclick = () => {
+          window.open(redirectTarget, '_blank');
+        };
+        document.title="WebRTC Tunnel [请勿退出]";
+        // 尝试自动跳转
+        setTimeout(() => {
+          const newWin = window.open(redirectTarget, '_blank');
+          // 如果浏览器拦截了自动弹窗，newWin 会为 null
+          if (!newWin || newWin.closed || typeof newWin.closed == 'undefined') {
+            log("自动跳转被浏览器拦截，请点击下方按钮进入。", "warn");
+            warnBox.innerHTML = "隧道已就绪！<br><b>请勿关闭此页面</b>，关闭后页面将无法使用。<br>自动跳转被拦截，请点击下方按钮进入系统。";
+          } else {
+            log("已在新标签页打开。", "success");
+            warnBox.innerHTML = "已在新标签页打开。<br><b>请勿关闭此页面</b>，关闭后页面将无法使用。";
+          }
+        }, 500);
+      };
+      
+      dc.onclose = () => {
+        updateStatus("Disconnected", "failed");
+        log("隧道已断开", "error");
+        if (pingInterval) clearInterval(pingInterval);
+      };
+
+      await pc.setLocalDescription(await pc.createOffer());
+      
+      if (pc.iceGatheringState !== "complete") {
+        await new Promise((resolve) => {
+          pc.addEventListener("icegatheringstatechange", () => {
+            if (pc.iceGatheringState === "complete") resolve();
+          });
+        });
+      }
+
+      const offer = { sdp: pc.localDescription.sdp, type: pc.localDescription.type };
+      const res = await fetch("/signal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(offer),
+      });
+      
+      if (!res.ok) throw new Error("信令 HTTP 错误: " + res.status);
+      await pc.setRemoteDescription(await res.json());
+      
+    } catch (err) {
+      updateStatus("Failed", "failed");
+      log(`失败: ${err.message}`, "error");
+    }
+  }
+
+  try {
+    log("注册 Service Worker...");
+    // 加上版本号防止旧缓存捣乱
+    await navigator.serviceWorker.register("/sw.js?v=2", { scope: "/" });
+    await navigator.serviceWorker.ready;
+    $('metric-sw').textContent = "Ready";
+
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = onSWMessage;
+
+    if (!navigator.serviceWorker.controller) {
+      log("等待 SW 接管...");
+      await new Promise((r) =>
+        navigator.serviceWorker.addEventListener("controllerchange", r, { once: true })
+      );
+    }
+    
+    navigator.serviceWorker.controller.postMessage({ type: "port", port: port2 }, [port2]);
+    log("SW 通信已建立，正在拉起 WebRTC...", "success");
+
+    await initWebRTC();
+  } catch (e) {
+    updateStatus("Init Failed", "failed");
+    log(`初始化失败: ${e.message}`, "error");
+  }
+})();
+</script>
+</body>
+</html>
